@@ -17,12 +17,12 @@ PHP 8.1+ REST API hosted on the Central Server computer. UtilityTrack and LifeCy
 
 ## Run under XAMPP on the same Wi-Fi
 
-1. Place this repository in the XAMPP web root, for example C:\xampp\htdocs\SIA101_Central-Server.
-2. Start Apache. The API base path will be http://localhost/SIA101_Central-Server/public.
+1. Place this repository in the XAMPP web root, for example C:\xampp\htdocs\SIA103_Central-Server.
+2. Start Apache. The API base path will be http://localhost/SIA103_Central-Server/public.
 3. On the Central Server computer, run ipconfig and find the Wi-Fi adapter's IPv4 address, for example 192.168.1.50.
 4. Allow inbound Apache traffic on its port (usually 80) in Windows Firewall for the Private network profile. Ensure Wi-Fi client isolation is disabled on the router.
-5. From another computer on the same Wi-Fi, open http://192.168.1.50/SIA101_Central-Server/public/api/v1/health, replacing the example IP with the actual address. A configured API returns {"ok":true,...}.
-6. Set each subsystem's CENTRAL_API_BASE_URL to http://192.168.1.50/SIA101_Central-Server/public and its own token. Do not use localhost from subsystem computers.
+5. From another computer on the same Wi-Fi, open http://192.168.1.50/SIA103_Central-Server/public/api/v1/health, replacing the example IP with the actual address. A configured API returns {"ok":true,...}.
+6. Set each subsystem's CENTRAL_API_BASE_URL to http://192.168.1.50/SIA103_Central-Server/public and its own token. Do not use localhost from subsystem computers.
 
 Use HTTPS before transmitting bearer tokens on Wi-Fi where other devices may observe traffic. HTTP does not encrypt tokens or payloads.
 
