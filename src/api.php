@@ -198,7 +198,7 @@ function handle_api_request(): never
 
     if ($method === 'GET' && preg_match('#/api/v1/health$#', $path)) {
         try {
-            central_supabase_config();
+            central_supabase_request('GET', ['select' => 'id', 'limit' => '0']);
             central_json(200, ['ok' => true, 'service' => 'SIA101 Central Server', 'api_version' => 'v1']);
         } catch (Throwable $error) {
             error_log('Central API configuration error: ' . $error->getMessage());
