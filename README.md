@@ -28,7 +28,7 @@ Use HTTPS before transmitting bearer tokens on Wi-Fi where other devices may obs
 
 ## API routes
 
-- GET /api/v1/health — confirms required Supabase configuration is present.
+- GET /api/v1/health — checks that the API can reach the configured Supabase table.
 - POST /api/v1/ingest/utility_bill and DELETE /api/v1/ingest/utility_bill/{id}
 - POST /api/v1/ingest/utility_anomaly and DELETE /api/v1/ingest/utility_anomaly/{id}
 - POST /api/v1/ingest/lifecycle_asset and DELETE /api/v1/ingest/lifecycle_asset/{id}
