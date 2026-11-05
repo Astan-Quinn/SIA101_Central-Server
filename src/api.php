@@ -45,7 +45,10 @@ function central_supabase_request(string $method, array $query, ?array $body = n
     $url = $baseUrl . '/rest/v1/central_records';
     if ($query !== []) $url .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
 
-    $headers = ['apikey: ' . $key, 'Authorization: Bearer ' . $key, 'Accept: application/json'];
+    // New sb_secret keys must be sent only as apikey; they are not JWTs.
+    // The legacy service_role key is a JWT and can also populate Authorization.
+    $headers = ['apikey: ' . $key, 'Accept: application/json'];
+    if (!str_starts_with($key, 'sb_secret_')) $headers[] = 'Authorization: Bearer ' . $key;
     if ($body !== null) {
         $headers[] = 'Content-Type: application/json';
         $headers[] = 'Prefer: resolution=merge-duplicates,return=minimal';
