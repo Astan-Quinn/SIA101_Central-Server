@@ -4,7 +4,7 @@ declare(strict_types=1);
 function central_env(string $name, string $default = ''): string
 {
     $value = getenv($name);
-    return $value === false ? ($_ENV[$name] ?? $default) : (string) $value;
+    return $value === false ? (string) ($_ENV[$name] ?? $default) : (string) $value;
 }
 
 function central_load_env(): void
@@ -27,22 +27,59 @@ function central_json(int $status, array $body): never
     exit;
 }
 
-function central_db(): PDO
+function central_supabase_config(): array
 {
-    static $pdo = null;
-    if ($pdo instanceof PDO) return $pdo;
+    $url = rtrim(trim(central_env('SUPABASE_URL')), '/');
+    $key = trim(central_env('SUPABASE_SECRET_KEY'));
+    if ($url === '' || $key === '') throw new RuntimeException('Central Supabase is not configured');
+    if (!filter_var($url, FILTER_VALIDATE_URL) || !str_starts_with($url, 'https://')) {
+        throw new RuntimeException('SUPABASE_URL must be an HTTPS URL');
+    }
+    if (!function_exists('curl_init')) throw new RuntimeException('PHP cURL extension is required');
+    return [$url, $key];
+}
 
-    $host = central_env('DB_HOST', '127.0.0.1');
-    $port = central_env('DB_PORT', '5432');
-    $database = central_env('DB_DATABASE', 'central_server');
-    $sslmode = central_env('DB_SSLMODE', 'prefer');
-    $dsn = 'pgsql:host=' . $host . ';port=' . $port . ';dbname=' . $database . ';sslmode=' . $sslmode;
-    $pdo = new PDO($dsn, central_env('DB_USERNAME'), central_env('DB_PASSWORD'), [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-        PDO::ATTR_EMULATE_PREPARES => false,
+function central_supabase_request(string $method, array $query, ?array $body = null): array
+{
+    [$baseUrl, $key] = central_supabase_config();
+    $url = $baseUrl . '/rest/v1/central_records';
+    if ($query !== []) $url .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+
+    $headers = ['apikey: ' . $key, 'Authorization: Bearer ' . $key, 'Accept: application/json'];
+    if ($body !== null) {
+        $headers[] = 'Content-Type: application/json';
+        $headers[] = 'Prefer: resolution=merge-duplicates,return=minimal';
+    }
+
+    $handle = curl_init($url);
+    curl_setopt_array($handle, [
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_TIMEOUT => max(5, (int) central_env('SUPABASE_TIMEOUT', '12')),
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
     ]);
-    return $pdo;
+    if ($body !== null) {
+        $encoded = json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+        if ($encoded === false) {
+            curl_close($handle);
+            throw new RuntimeException('Could not encode Supabase request');
+        }
+        curl_setopt($handle, CURLOPT_POSTFIELDS, $encoded);
+    }
+
+    $response = curl_exec($handle);
+    $status = (int) curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
+    $curlError = curl_error($handle);
+    curl_close($handle);
+    if ($response === false) throw new RuntimeException('Supabase connection failed: ' . $curlError);
+    if ($status < 200 || $status >= 300) {
+        error_log('Central Supabase returned HTTP ' . $status . ': ' . substr((string) $response, 0, 500));
+        throw new RuntimeException('Supabase write failed with HTTP ' . $status);
+    }
+    return [$status, $response];
 }
 
 function central_route_source(string $recordType): ?string
@@ -107,54 +144,47 @@ function central_allowed_fields(string $recordType): array
 
 function central_validate_payload(string $recordType, array $input): array
 {
-    $allowed = central_allowed_fields($recordType);
-    $payload = array_intersect_key($input, array_flip($allowed));
+    $payload = array_intersect_key($input, array_flip(central_allowed_fields($recordType)));
     $idValue = $payload['id'] ?? null;
     if (!is_string($idValue) && !is_int($idValue)) central_json(422, ['ok' => false, 'error' => 'id_must_be_string_or_integer']);
     $id = trim((string) $idValue);
     if ($id === '' || strlen($id) > 100) central_json(422, ['ok' => false, 'error' => 'id_required']);
     $payload['id'] = $id;
 
-    if ($recordType === 'utility_bill' && !in_array($payload['utility'] ?? null, ['electricity', 'water'], true)) {
-        central_json(422, ['ok' => false, 'error' => 'utility_must_be_electricity_or_water']);
-    }
-    if ($recordType === 'utility_anomaly' && !in_array($payload['utility'] ?? null, ['electricity', 'water'], true)) {
+    if (in_array($recordType, ['utility_bill', 'utility_anomaly'], true)
+        && !in_array($payload['utility'] ?? null, ['electricity', 'water'], true)) {
         central_json(422, ['ok' => false, 'error' => 'utility_must_be_electricity_or_water']);
     }
     if ($recordType === 'lifecycle_asset'
         && !in_array($payload['entity_type'] ?? null, ['equipment', 'facility'], true)) {
         central_json(422, ['ok' => false, 'error' => 'entity_type_must_be_equipment_or_facility']);
     }
-
     return [$id, $payload];
 }
 
-function central_store_record(string $source, string $recordType, string $sourceId, array $payload): void
+function central_upsert_record(string $source, string $recordType, string $sourceId, array $payload): void
 {
-    $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
-    if ($json === false) central_json(422, ['ok' => false, 'error' => 'invalid_json_payload']);
-
-    $stmt = central_db()->prepare(
-        'INSERT INTO public.central_records (source_system, record_type, source_id, payload, received_at, updated_at, deleted_at)
-         VALUES (:source, :record_type, :source_id, CAST(:payload AS jsonb), now(), now(), NULL)
-         ON CONFLICT (source_system, record_type, source_id)
-         DO UPDATE SET payload = EXCLUDED.payload, updated_at = now(), deleted_at = NULL'
-    );
-    $stmt->execute([
-        'source' => $source,
+    $now = gmdate('c');
+    central_supabase_request('POST', [
+        'on_conflict' => 'source_system,record_type,source_id',
+    ], [[
+        'source_system' => $source,
         'record_type' => $recordType,
         'source_id' => $sourceId,
-        'payload' => $json,
-    ]);
+        'payload' => $payload,
+        'received_at' => $now,
+        'updated_at' => $now,
+        'deleted_at' => null,
+    ]]);
 }
 
 function central_delete_record(string $source, string $recordType, string $sourceId): void
 {
-    $stmt = central_db()->prepare(
-        'UPDATE public.central_records SET deleted_at = now(), updated_at = now()
-         WHERE source_system = :source AND record_type = :record_type AND source_id = :source_id'
-    );
-    $stmt->execute(['source' => $source, 'record_type' => $recordType, 'source_id' => $sourceId]);
+    central_supabase_request('PATCH', [
+        'source_system' => 'eq.' . $source,
+        'record_type' => 'eq.' . $recordType,
+        'source_id' => 'eq.' . $sourceId,
+    ], ['deleted_at' => gmdate('c'), 'updated_at' => gmdate('c')]);
 }
 
 function handle_api_request(): never
@@ -167,7 +197,13 @@ function handle_api_request(): never
     $path = '/' . trim(preg_replace('#/+#', '/', $path), '/');
 
     if ($method === 'GET' && preg_match('#/api/v1/health$#', $path)) {
-        central_json(200, ['ok' => true, 'service' => 'SIA101 Central Server', 'api_version' => 'v1']);
+        try {
+            central_supabase_config();
+            central_json(200, ['ok' => true, 'service' => 'SIA101 Central Server', 'api_version' => 'v1']);
+        } catch (Throwable $error) {
+            error_log('Central API configuration error: ' . $error->getMessage());
+            central_json(503, ['ok' => false, 'error' => 'service_not_configured']);
+        }
     }
 
     if (!preg_match('#/api/v1/ingest/([a-z_]+)(?:/([^/]+))?$#', $path, $matches)) {
@@ -201,13 +237,13 @@ function handle_api_request(): never
     $raw = file_get_contents('php://input', false, null, 0, $limit + 1);
     if ($raw === false || strlen($raw) > $limit) central_json(413, ['ok' => false, 'error' => 'request_too_large']);
     $trimmed = ltrim($raw);
-    if ($trimmed === '' || ($trimmed[0] !== '{' && $trimmed[0] !== '[')) central_json(400, ['ok' => false, 'error' => 'json_object_required']);
+    if ($trimmed === '' || $trimmed[0] !== '{') central_json(400, ['ok' => false, 'error' => 'json_object_required']);
     $input = json_decode($raw, true);
     if (!is_array($input) || array_is_list($input)) central_json(400, ['ok' => false, 'error' => 'json_object_required']);
 
     [$sourceId, $payload] = central_validate_payload($recordType, $input);
     try {
-        central_store_record($source, $recordType, $sourceId, $payload);
+        central_upsert_record($source, $recordType, $sourceId, $payload);
         central_json(200, ['ok' => true, 'record_type' => $recordType, 'source_id' => $sourceId]);
     } catch (Throwable $error) {
         error_log('Central API upsert failed: ' . $error->getMessage());
