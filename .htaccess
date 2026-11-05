@@ -1,0 +1,4 @@
+Options -Indexes
+<FilesMatch "^\.(?!well-known)">
+    Require all denied
+</FilesMatch>
