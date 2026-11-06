@@ -4,9 +4,18 @@ PHP 8.1+ REST API hosted on the Central Server computer. UtilityTrack and LifeCy
 
 ## Requirements
 
+<<<<<<< Updated upstream
 - PHP 8.1+ with cURL enabled
 - Apache with mod_rewrite enabled (included with XAMPP)
 - A Supabase project for the Central Server
+=======
+1. Copy `.env.example` to `.env` and set PostgreSQL connection details and two different long random API tokens.
+2. Create the PostgreSQL database named in `DB_DATABASE` and run `database/schema.sql`.
+3. Enable PHP `pdo_pgsql` and `pgsql` in `php.ini`, then restart Apache.
+4. Point Apache at this project, or run PHP's built-in server with `public` as its document root. On the server computer, `localhost` works for a local check. For other computers on the same Wi-Fi, use the server computer's LAN IPv4 address, for example `http://192.168.1.50/SIA101_Central-Server/public/` (replace the example IP with the address shown by `ipconfig`). Do not use `localhost` in a client subsystem's URL; it would refer to that subsystem's own computer.
+5. Allow inbound Apache traffic on the configured port (usually 80 for HTTP or 443 for HTTPS) in Windows Firewall for the Private network profile. Keep the server and clients on the same reachable Wi-Fi/LAN, and consider reserving the server's IP in DHCP so the configured URL stays stable.
+6. Send `Authorization: Bearer <source token>` and a JSON body to one of the ingestion routes below. Use HTTPS before transmitting bearer tokens over Wi-Fi; plain HTTP exposes them to other parties able to observe the network.
+>>>>>>> Stashed changes
 
 ## Configure the central Supabase project
 
