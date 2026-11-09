@@ -39,19 +39,21 @@ function central_supabase_config(): array
     return [$url, $key];
 }
 
-function central_supabase_request(string $method, array $query, ?array $body = null): array
+function central_supabase_request(string $method, array $query, ?array $body = null, string $resource = 'central_records'): array
 {
     [$baseUrl, $key] = central_supabase_config();
-    $url = $baseUrl . '/rest/v1/central_records';
+    $url = $baseUrl . '/rest/v1/' . ltrim($resource, '/');
     if ($query !== []) $url .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
 
     // New sb_secret keys must be sent only as apikey; they are not JWTs.
     // The legacy service_role key is a JWT and can also populate Authorization.
-    $headers = ['apikey: ' . $key, 'Accept: application/json'];
+    $headers = ['apikey: ' . $key, 'Accept: application/json', 'Content-Profile: public'];
     if (!str_starts_with($key, 'sb_secret_')) $headers[] = 'Authorization: Bearer ' . $key;
     if ($body !== null) {
         $headers[] = 'Content-Type: application/json';
-        $headers[] = 'Prefer: resolution=merge-duplicates,return=minimal';
+        $headers[] = str_starts_with($resource, 'rpc/')
+            ? 'Prefer: return=representation'
+            : 'Prefer: resolution=merge-duplicates,return=minimal';
     }
 
     $handle = curl_init($url);
@@ -127,19 +129,19 @@ function central_allowed_fields(string $recordType): array
 {
     return match ($recordType) {
         'utility_bill' => [
-            'id', 'utility', 'created_at', 'billing_date', 'billing_period', 'billing_period_from',
+            'id', 'utility', 'created_at', 'updated_at', 'source_updated_at', 'billing_date', 'billing_period', 'billing_period_from',
             'billing_period_to', 'account_number', 'source', 'location', 'previous_reading',
             'current_reading', 'consumption', 'rate', 'subtotal', 'vat_amount', 'other_charges',
             'other_fees', 'charge_items', 'total_amount', 'due_date', 'status',
         ],
         'utility_anomaly' => [
-            'id', 'created_at', 'utility', 'current_period', 'previous_period', 'cur_cons', 'prev_cons',
+            'id', 'created_at', 'updated_at', 'source_updated_at', 'utility', 'current_period', 'previous_period', 'cur_cons', 'prev_cons',
             'cur_cost', 'prev_cost', 'pct_cons', 'pct_cost', 'pct_rate', 'cause', 'status', 'result',
         ],
         'lifecycle_asset' => [
             'id', 'entity_type', 'asset_tag', 'name', 'brand', 'model', 'category', 'location',
             'date_acquired', 'acquisition_year', 'is_estimated_year', 'condition', 'lifecycle_status',
-            'quantity', 'basis', 'cost', 'schedule', 'hours_per_day', 'remarks', 'created_at', 'updated_at',
+            'quantity', 'basis', 'cost', 'schedule', 'hours_per_day', 'remarks', 'created_at', 'updated_at', 'source_updated_at',
         ],
         default => [],
     };
@@ -165,29 +167,24 @@ function central_validate_payload(string $recordType, array $input): array
     return [$id, $payload];
 }
 
-function central_upsert_record(string $source, string $recordType, string $sourceId, array $payload): void
+function central_queue_event(string $source, string $recordType, string $sourceId, string $operation, ?array $payload, ?string $sourceVersion = null): string
 {
-    $now = gmdate('c');
-    central_supabase_request('POST', [
-        'on_conflict' => 'source_system,record_type,source_id',
-    ], [[
+    $utc = new DateTimeZone('UTC');
+    $receivedAt = (new DateTimeImmutable('now', $utc))->format('Y-m-d\TH:i:s.u\Z');
+    $sourceUpdatedAt = trim((string) ($sourceVersion ?? $payload['source_updated_at'] ?? $payload['updated_at'] ?? ''));
+    if ($sourceUpdatedAt === '' || strtotime($sourceUpdatedAt) === false) $sourceUpdatedAt = $receivedAt;
+    else $sourceUpdatedAt = (new DateTimeImmutable($sourceUpdatedAt))->setTimezone($utc)->format('Y-m-d\TH:i:s.u\Z');
+    $message = [
+        'operation' => $operation,
         'source_system' => $source,
         'record_type' => $recordType,
         'source_id' => $sourceId,
+        'source_updated_at' => $sourceUpdatedAt,
+        'received_at' => $receivedAt,
         'payload' => $payload,
-        'received_at' => $now,
-        'updated_at' => $now,
-        'deleted_at' => null,
-    ]]);
-}
-
-function central_delete_record(string $source, string $recordType, string $sourceId): void
-{
-    central_supabase_request('PATCH', [
-        'source_system' => 'eq.' . $source,
-        'record_type' => 'eq.' . $recordType,
-        'source_id' => 'eq.' . $sourceId,
-    ], ['deleted_at' => gmdate('c'), 'updated_at' => gmdate('c')]);
+    ];
+    central_supabase_request('POST', [], ['p_message' => $message], 'rpc/central_queue_send');
+    return $receivedAt;
 }
 
 function handle_api_request(): never
@@ -201,8 +198,8 @@ function handle_api_request(): never
 
     if ($method === 'GET' && preg_match('#/api/v1/health$#', $path)) {
         try {
-            central_supabase_request('GET', ['select' => 'id', 'limit' => '0']);
-            central_json(200, ['ok' => true, 'service' => 'SIA101 Central Server', 'api_version' => 'v1']);
+            central_supabase_config();
+            central_json(200, ['ok' => true, 'service' => 'SIA101 Central Server', 'api_version' => 'v1', 'queue' => 'central_sync_events']);
         } catch (Throwable $error) {
             error_log('Central API configuration error: ' . $error->getMessage());
             central_json(503, ['ok' => false, 'error' => 'service_not_configured']);
@@ -221,8 +218,8 @@ function handle_api_request(): never
         $sourceId = rawurldecode($matches[2]);
         if ($sourceId === '' || strlen($sourceId) > 100) central_json(422, ['ok' => false, 'error' => 'invalid_id']);
         try {
-            central_delete_record($source, $recordType, $sourceId);
-            central_json(200, ['ok' => true, 'record_type' => $recordType, 'source_id' => $sourceId, 'deleted' => true]);
+            $queuedAt = central_queue_event($source, $recordType, $sourceId, 'delete', null, (string) ($_GET['source_updated_at'] ?? ''));
+            central_json(202, ['ok' => true, 'queued' => true, 'record_type' => $recordType, 'source_id' => $sourceId, 'queued_at' => $queuedAt]);
         } catch (Throwable $error) {
             error_log('Central API delete failed: ' . $error->getMessage());
             central_json(503, ['ok' => false, 'error' => 'storage_unavailable']);
@@ -246,8 +243,8 @@ function handle_api_request(): never
 
     [$sourceId, $payload] = central_validate_payload($recordType, $input);
     try {
-        central_upsert_record($source, $recordType, $sourceId, $payload);
-        central_json(200, ['ok' => true, 'record_type' => $recordType, 'source_id' => $sourceId]);
+        $queuedAt = central_queue_event($source, $recordType, $sourceId, 'upsert', $payload);
+        central_json(202, ['ok' => true, 'queued' => true, 'record_type' => $recordType, 'source_id' => $sourceId, 'queued_at' => $queuedAt]);
     } catch (Throwable $error) {
         error_log('Central API upsert failed: ' . $error->getMessage());
         central_json(503, ['ok' => false, 'error' => 'storage_unavailable']);

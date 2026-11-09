@@ -1,12 +1,12 @@
 # Central REST API contract (v1)
 
-UtilityTrack and LifeCycleTrack remain the owners of their records and send sanitized copies to the Central Server. The PHP API authenticates subsystem bearer tokens and writes accepted records to the Central Server Supabase project's public.central_records table.
+UtilityTrack and LifeCycleTrack remain the owners of their records and send sanitized snapshots to the Central Server. The PHP API authenticates subsystem bearer tokens and enqueues accepted events in Supabase Queues. A worker applies them to type-specific central tables.
 
 ## Authentication and responses
 
 Send Authorization: Bearer <subsystem token> and Content-Type: application/json. UtilityTrack and LifeCycleTrack use different tokens; each is restricted to its assigned record types.
 
-Upserts return HTTP 200 with {"ok":true,"record_type":"...","source_id":"..."}. Repeating an upsert replaces the payload for the same source identity. Invalid JSON returns 400; invalid fields return 422; missing or invalid caller credentials return 401; missing server configuration or Supabase failures return 503. Requests are limited to 1 MiB by default.
+Accepted upserts and deletes return HTTP 202 with `queued: true`, record type, source ID, and queue timestamp. This confirms durable enqueueing, not completion by the worker. Invalid JSON returns 400; invalid fields return 422; missing or invalid caller credentials return 401; missing server configuration or Supabase failures return 503. Requests are limited to 1 MiB by default.
 
 ## Routes
 
@@ -20,7 +20,7 @@ Upserts return HTTP 200 with {"ok":true,"record_type":"...","source_id":"..."}. 
 | POST | /api/v1/ingest/lifecycle_asset | LifeCycleTrack | Create or update equipment or facility |
 | DELETE | /api/v1/ingest/lifecycle_asset/{id} | LifeCycleTrack | Soft-delete an asset/facility copy |
 
-The sender's id is its stable source identifier. Central identity is (source_system, record_type, source_id). A later upsert restores a soft-deleted row.
+The sender's id is its stable source identifier. Central identity is (source_system, record_type, source_id). Events contain operation, source system, record type, source ID, source update time, received time, and sanitized payload. A later upsert restores a soft-deleted row. Duplicate or older events do not overwrite newer central state.
 
 ## Accepted payload fields
 
@@ -57,4 +57,4 @@ Unknown properties are dropped. User IDs, account holder names, payment referenc
       "lifecycle_status": "Serviceable"
     }
 
-The API stores accepted JSON payload, source system/type/ID, and timestamps in the Central Server Supabase project. This version has no historical backfill, central read/report API, or cross-system matching.
+The worker stores accepted payloads in `central_utility_bills`, `central_utility_anomalies`, or `central_lifecycle_assets`. Failed messages retry after the visibility timeout. After eight failed reads they move to `central_sync_dead_letter` for review. This version has no historical backfill, central read/report API, or cross-system matching.
