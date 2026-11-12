@@ -101,6 +101,17 @@ function central_token_for(string $source): string
     return match ($source) {
         'UtilityTrack' => trim(central_env('UTILITYTRACK_API_TOKEN')),
         'LifeCycleTrack' => trim(central_env('LIFECYCLETRACK_API_TOKEN')),
+        'MaintainTrack' => trim(central_env('MAINTAINTRACK_API_TOKEN')),
+        default => '',
+    };
+}
+
+function central_inbox_token_for(string $destination): string
+{
+    return match ($destination) {
+        'UtilityTrack' => trim(central_env('UTILITYTRACK_INBOX_TOKEN')),
+        'LifeCycleTrack' => trim(central_env('LIFECYCLETRACK_INBOX_TOKEN')),
+        'MaintainTrack' => trim(central_env('MAINTAINTRACK_INBOX_TOKEN')),
         default => '',
     };
 }
@@ -141,10 +152,158 @@ function central_allowed_fields(string $recordType): array
         'lifecycle_asset' => [
             'id', 'entity_type', 'asset_tag', 'name', 'brand', 'model', 'category', 'location',
             'date_acquired', 'acquisition_year', 'is_estimated_year', 'condition', 'lifecycle_status',
-            'quantity', 'basis', 'cost', 'schedule', 'hours_per_day', 'remarks', 'created_at', 'updated_at', 'source_updated_at',
+            'quantity', 'basis', 'cost', 'schedule', 'hours_per_day', 'created_at', 'updated_at', 'source_updated_at',
         ],
         default => [],
     };
+}
+
+function central_validate_integration_event(array $event, string $authenticatedSource): array
+{
+    $uuidPattern = '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i';
+    $eventId = (string) ($event['event_id'] ?? '');
+    $source = (string) ($event['source'] ?? '');
+    $recordType = (string) ($event['record_type'] ?? '');
+    $eventType = (string) ($event['event_type'] ?? '');
+    $version = (string) ($event['version'] ?? '');
+    $sourceId = trim((string) ($event['source_id'] ?? ''));
+    $occurredAt = (string) ($event['occurred_at'] ?? '');
+    $correlation = $event['correlation_id'] ?? null;
+    $payload = $event['payload'] ?? null;
+
+    if (!preg_match($uuidPattern, $eventId)
+        || ($correlation !== null && !preg_match($uuidPattern, (string) $correlation))
+        || $source !== $authenticatedSource
+        || $source !== 'LifeCycleTrack'
+        || $recordType !== 'lifecycle_asset'
+        || !in_array($eventType, ['lifecycle.asset.upserted', 'lifecycle.asset.deleted'], true)
+        || $version !== '1.0'
+        || $sourceId === '' || strlen($sourceId) > 100
+        || strtotime($occurredAt) === false
+        || !is_array($payload) || array_is_list($payload)
+        || (string) ($payload['id'] ?? '') !== $sourceId
+        || !in_array($payload['entity_type'] ?? null, ['equipment', 'facility'], true)) {
+        throw new InvalidArgumentException('Invalid event envelope');
+    }
+
+    $allowed = central_allowed_fields($recordType);
+    $safePayload = array_intersect_key($payload, array_flip($allowed));
+    $safePayload['id'] = $sourceId;
+    $safePayload['entity_type'] = $payload['entity_type'];
+    $clean = [
+        'event_id' => strtolower($eventId),
+        'event_type' => $eventType,
+        'source' => $source,
+        // The central router resolves destination exclusively from subscriptions.
+        'destination' => null,
+        'version' => $version,
+        'correlation_id' => $correlation === null ? null : strtolower((string) $correlation),
+        'occurred_at' => (new DateTimeImmutable($occurredAt))->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s.u\Z'),
+        'source_id' => $sourceId,
+        'record_type' => $recordType,
+        'payload' => $safePayload,
+    ];
+    return $clean;
+}
+
+function central_authorize_inbox(string $destination): void
+{
+    $expected = central_inbox_token_for($destination);
+    if ($expected === '') central_json(503, ['ok' => false, 'error' => 'inbox_auth_not_configured']);
+    $authorization = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
+    if ($authorization === '' && function_exists('getallheaders')) {
+        foreach (getallheaders() as $name => $value) {
+            if (strtolower((string) $name) === 'authorization') { $authorization = (string) $value; break; }
+        }
+    }
+    if (!preg_match('/^Bearer\s+(.+)$/i', trim((string) $authorization), $matches)
+        || !hash_equals($expected, trim($matches[1]))) {
+        central_json(401, ['ok' => false, 'error' => 'unauthorized']);
+    }
+}
+
+function central_read_request_object(int $maxBytes): array
+{
+    $length = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
+    if ($length > $maxBytes) central_json(413, ['ok' => false, 'error' => 'request_too_large']);
+    $raw = file_get_contents('php://input', false, null, 0, $maxBytes + 1);
+    if ($raw === false || strlen($raw) > $maxBytes) central_json(413, ['ok' => false, 'error' => 'request_too_large']);
+    $value = json_decode($raw, true);
+    if (!is_array($value) || array_is_list($value)) central_json(400, ['ok' => false, 'error' => 'json_object_required']);
+    return $value;
+}
+
+function central_handle_integration_request(string $method, string $path): bool
+{
+    if ($method === 'POST' && $path === '/api/v1/events') {
+        $input = central_read_request_object(max(1024, (int) central_env('MAX_REQUEST_BYTES', '1048576')));
+        $source = (string) ($input['source'] ?? '');
+        if (!in_array($source, ['LifeCycleTrack'], true)) central_json(422, ['ok' => false, 'error' => 'unsupported_event_source']);
+        central_authorize($source);
+        try {
+            $event = central_validate_integration_event($input, $source);
+        } catch (InvalidArgumentException) {
+            central_json(422, ['ok' => false, 'error' => 'invalid_event']);
+        }
+        try {
+            [, $body] = central_supabase_request('POST', [], ['p_event' => $event, 'p_authenticated_source' => $source], 'rpc/integration_accept_event');
+            $result = json_decode($body, true);
+            if (!is_array($result)) throw new RuntimeException('Integration RPC returned an invalid response');
+            central_json(202, ['ok' => true] + $result);
+        } catch (Throwable $error) {
+            error_log('Central integration event intake failed: ' . $error->getMessage());
+            central_json(503, ['ok' => false, 'error' => 'event_storage_unavailable']);
+        }
+    }
+
+    if (preg_match('#^/api/v1/inbox/(LifeCycleTrack|UtilityTrack|MaintainTrack)/(read|ack)$#', $path, $matches)) {
+        $destination = $matches[1];
+        $action = $matches[2];
+        if ($method !== 'POST') { header('Allow: POST'); central_json(405, ['ok' => false, 'error' => 'method_not_allowed']); }
+        central_authorize_inbox($destination);
+        $input = central_read_request_object(8192);
+        try {
+            if ($action === 'read') {
+                $count = max(1, min(50, (int) ($input['count'] ?? 10)));
+                $visibility = max(10, min(3600, (int) ($input['visibility_seconds'] ?? central_env('QUEUE_VISIBILITY_SECONDS', '120'))));
+                [, $body] = central_supabase_request('POST', [], [
+                    'p_destination' => $destination,
+                    'p_visibility_seconds' => $visibility,
+                    'p_count' => $count,
+                ], 'rpc/integration_read_inbox');
+                $rows = json_decode($body, true);
+                if (!is_array($rows)) throw new RuntimeException('Inbox read returned an invalid response');
+                $maxReads = max(1, (int) central_env('QUEUE_MAX_READS', '8'));
+                $messages = [];
+                foreach ($rows as $row) {
+                    if ((int) ($row['read_ct'] ?? 0) >= $maxReads) {
+                        central_supabase_request('POST', [], [
+                            'p_destination' => $destination,
+                            'p_msg_id' => (int) ($row['msg_id'] ?? 0),
+                            'p_message' => $row['message'] ?? new stdClass(),
+                            'p_reason' => 'maximum delivery reads exceeded',
+                        ], 'rpc/integration_deadletter_inbox');
+                        continue;
+                    }
+                    $messages[] = [
+                        'msg_id' => (int) ($row['msg_id'] ?? 0),
+                        'read_ct' => (int) ($row['read_ct'] ?? 0),
+                        'visibility_until' => $row['vt'] ?? null,
+                        'event' => $row['message'] ?? null,
+                    ];
+                }
+                central_json(200, ['ok' => true, 'messages' => $messages]);
+            }
+            $messageId = (int) ($input['msg_id'] ?? 0);
+            if ($messageId < 1) central_json(422, ['ok' => false, 'error' => 'invalid_message_id']);
+            [, $body] = central_supabase_request('POST', [], ['p_destination' => $destination, 'p_msg_id' => $messageId], 'rpc/integration_ack_inbox');
+            central_json(200, ['ok' => true, 'acknowledged' => json_decode($body, true) === true]);
+        } catch (Throwable $error) {
+            error_log('Central inbox operation failed for ' . $destination . ': ' . $error->getMessage());
+            central_json(503, ['ok' => false, 'error' => 'inbox_unavailable']);
+        }
+    }
+    return false;
 }
 
 function central_validate_payload(string $recordType, array $input): array
@@ -205,6 +364,8 @@ function handle_api_request(): never
             central_json(503, ['ok' => false, 'error' => 'service_not_configured']);
         }
     }
+
+    central_handle_integration_request($method, $path);
 
     if (!preg_match('#/api/v1/ingest/([a-z_]+)(?:/([^/]+))?$#', $path, $matches)) {
         central_json(404, ['ok' => false, 'error' => 'route_not_found']);

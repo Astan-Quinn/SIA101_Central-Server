@@ -1,11 +1,11 @@
 # SIA101 Central Server
 
-PHP 8.1+ API that authenticates UtilityTrack and LifeCycleTrack senders, places sanitized events in Supabase Queues, and applies them asynchronously to central reporting tables.
+PHP 8.1+ API that authenticates subsystem senders, persists sanitized events, routes them through Supabase Queues, and exposes inbox access through destination-scoped HTTPS credentials.
 
 ## Configure Supabase
 
-1. In the Central Server Supabase project, open SQL Editor and run `database/schema.sql`. It enables `pgmq`, creates the durable `central_sync_events` and `central_sync_dead_letter` queues, the three record tables, and service-role-only RPC wrappers.
-2. Copy `.env.example` to `.env`. Set `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, and separate long random tokens for UtilityTrack and LifeCycleTrack. Never put the Supabase secret key in either subsystem or a browser.
+1. In the Central Server Supabase project, apply the base `database/schema.sql`, then `database/migrations/20261111_integration_foundation.sql` and `database/migrations/20261112_lifecycle_routing.sql`.
+2. Copy `.env.example` to `.env`. Set `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, source API tokens, and a distinct inbox token per subsystem. Never put the Central Supabase secret key in a subsystem or browser.
 3. Keep `QUEUE_VISIBILITY_SECONDS` above the maximum time spent handling a batch. The worker defaults to 120 seconds and moves a message to the dead-letter queue after eight failed reads.
 
 ## Run the API and worker
@@ -17,6 +17,8 @@ The ingestion routes return `202 Accepted` only after Supabase Queues accepts th
 ## API routes
 
 - `GET /api/v1/health`
+- `POST /api/v1/events` for canonical LifeCycleTrack events
+- `POST /api/v1/inbox/{subsystem}/read` and `/ack` for inbox workers, each using its own bearer token
 - `POST /api/v1/ingest/utility_bill` and `DELETE /api/v1/ingest/utility_bill/{id}`
 - `POST /api/v1/ingest/utility_anomaly` and `DELETE /api/v1/ingest/utility_anomaly/{id}`
 - `POST /api/v1/ingest/lifecycle_asset` and `DELETE /api/v1/ingest/lifecycle_asset/{id}`

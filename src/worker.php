@@ -28,11 +28,32 @@ function central_worker_apply(array $event): void
     central_worker_rpc('central_apply_event', ['p_event' => $event]);
 }
 
+function central_worker_route_events(int $limit = 10): int
+{
+    $visibility = max(30, (int) central_env('QUEUE_VISIBILITY_SECONDS', '120'));
+    [, $body] = central_worker_rpc('integration_route_events', [
+        'p_visibility_seconds' => $visibility,
+        'p_count' => max(1, min(50, $limit)),
+        'p_max_reads' => max(1, (int) central_env('QUEUE_MAX_READS', '8')),
+    ]);
+    $handled = json_decode($body, true);
+    if (!is_int($handled)) throw new RuntimeException('Integration router returned an invalid response');
+    return $handled;
+}
+
 function central_worker_run(int $limit = 10): int
 {
     central_load_env();
     $visibility = max(30, (int) central_env('QUEUE_VISIBILITY_SECONDS', '120'));
     $limit = max(1, min(50, $limit));
+    $routerHandled = 0;
+    try {
+        $routerHandled = central_worker_route_events($limit);
+    } catch (Throwable $error) {
+        // Preserve legacy queue processing if the new routing migration has
+        // not yet been applied or the integration router is temporarily down.
+        error_log('Central integration router unavailable: ' . $error->getMessage());
+    }
     [, $body] = central_worker_rpc('central_queue_read', [
         'p_visibility_seconds' => $visibility,
         'p_count' => $limit,
@@ -62,7 +83,7 @@ function central_worker_run(int $limit = 10): int
         }
         $handled++;
     }
-    return $handled;
+    return $handled + $routerHandled;
 }
 
 if (PHP_SAPI === 'cli' && realpath((string) ($_SERVER['SCRIPT_FILENAME'] ?? '')) === __FILE__) {

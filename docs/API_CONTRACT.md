@@ -1,6 +1,6 @@
 # Central REST API contract (v1)
 
-UtilityTrack and LifeCycleTrack remain the owners of their records and send sanitized snapshots to the Central Server. The PHP API authenticates subsystem bearer tokens and enqueues accepted events in Supabase Queues. A worker applies them to type-specific central tables.
+Each subsystem remains the owner of its records. The PHP API authenticates source bearer tokens, persists accepted canonical events, and routes them according to `event_subscriptions`. The Central Supabase service key remains on the Central Server.
 
 ## Authentication and responses
 
@@ -13,6 +13,9 @@ Accepted upserts and deletes return HTTP 202 with `queued: true`, record type, s
 | Method | Path | Source | Purpose |
 |---|---|---|---|
 | GET | /api/v1/health | Public | Confirms API configuration is present |
+| POST | /api/v1/events | LifeCycleTrack (phase 1) | Accepts the versioned event envelope and routes registered subscriptions |
+| POST | /api/v1/inbox/{subsystem}/read | Destination worker token | Reads only that subsystem's inbox with a visibility timeout |
+| POST | /api/v1/inbox/{subsystem}/ack | Destination worker token | Archives a message after the destination has committed processing |
 | POST | /api/v1/ingest/utility_bill | UtilityTrack | Create or update an electricity or water bill |
 | DELETE | /api/v1/ingest/utility_bill/{id} | UtilityTrack | Soft-delete a bill copy |
 | POST | /api/v1/ingest/utility_anomaly | UtilityTrack | Create or update an anomaly |
@@ -20,13 +23,13 @@ Accepted upserts and deletes return HTTP 202 with `queued: true`, record type, s
 | POST | /api/v1/ingest/lifecycle_asset | LifeCycleTrack | Create or update equipment or facility |
 | DELETE | /api/v1/ingest/lifecycle_asset/{id} | LifeCycleTrack | Soft-delete an asset/facility copy |
 
-The sender's id is its stable source identifier. Central identity is (source_system, record_type, source_id). Events contain operation, source system, record type, source ID, source update time, received time, and sanitized payload. A later upsert restores a soft-deleted row. Duplicate or older events do not overwrite newer central state.
+Canonical messages use `event_id`, `event_type`, `source`, `destination`, `version`, `correlation_id`, `occurred_at`, `source_id`, `record_type`, and `payload`. The authenticated token determines source identity; the sender-provided destination is not used for routing. Central resolves destinations from enabled subscriptions. Queue reads never acknowledge messages; a destination acknowledges only after its own database transaction commits.
 
 ## Accepted payload fields
 
 - utility_bill: id, utility, created_at, billing date/period fields, account number, source, location, readings, consumption, rate, subtotal, VAT, other charges, fee items, total, due date, and status.
 - utility_anomaly: id, created_at, utility, current/previous periods, consumption and cost values, percentage changes, cause, status, and result.
-- lifecycle_asset: id, entity_type (equipment or facility), asset tag, name, brand/model/category, location, acquisition information, condition/lifecycle status, quantity, cost/schedule fields, remarks, and timestamps.
+- lifecycle_asset: id, entity_type (equipment or facility), asset tag, name, brand/model/category, location, acquisition information, condition/lifecycle status, quantity, cost/schedule fields, and timestamps. Images and free-form remarks are excluded.
 
 Unknown properties are dropped. User IDs, account holder names, payment references, image paths, and free-form notes should not be sent from UtilityTrack. LifeCycleTrack should omit personal data and images.
 
