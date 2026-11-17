@@ -4,7 +4,7 @@ Each subsystem remains the owner of its records. The PHP API authenticates sourc
 
 ## Authentication and responses
 
-Send Authorization: Bearer <subsystem token> and Content-Type: application/json. UtilityTrack and LifeCycleTrack use different tokens; each is restricted to its assigned record types.
+Send Authorization: Bearer <subsystem token> and Content-Type: application/json. LifeCycleTrack, UtilityTrack, and MaintainTrack have separate source tokens restricted to their registered record types. Destination inbox tokens are separate credentials.
 
 Accepted upserts and deletes return HTTP 202 with `queued: true`, record type, source ID, and queue timestamp. This confirms durable enqueueing, not completion by the worker. Invalid JSON returns 400; invalid fields return 422; missing or invalid caller credentials return 401; missing server configuration or Supabase failures return 503. Requests are limited to 1 MiB by default.
 
@@ -13,9 +13,12 @@ Accepted upserts and deletes return HTTP 202 with `queued: true`, record type, s
 | Method | Path | Source | Purpose |
 |---|---|---|---|
 | GET | /api/v1/health | Public | Confirms API configuration is present |
-| POST | /api/v1/events | LifeCycleTrack (phase 1) | Accepts the versioned event envelope and routes registered subscriptions |
+| POST | /api/v1/events | LifeCycleTrack, UtilityTrack, MaintainTrack | Accepts the versioned event envelope and routes registered subscriptions |
 | POST | /api/v1/inbox/{subsystem}/read | Destination worker token | Reads only that subsystem's inbox with a visibility timeout |
 | POST | /api/v1/inbox/{subsystem}/ack | Destination worker token | Archives a message after the destination has committed processing |
+| GET | /api/v1/sync/status/{event_id} | Source token | Reads the caller's event and its per-destination delivery status |
+| GET | /api/v1/admin/summary | Central operator token | Lists recent deliveries and unresolved dead letters |
+| POST | /api/v1/admin/dead-letters/{id}/replay | Central operator token | Requeues a failed destination delivery with the original event ID |
 | POST | /api/v1/ingest/utility_bill | UtilityTrack | Create or update an electricity or water bill |
 | DELETE | /api/v1/ingest/utility_bill/{id} | UtilityTrack | Soft-delete a bill copy |
 | POST | /api/v1/ingest/utility_anomaly | UtilityTrack | Create or update an anomaly |
@@ -23,11 +26,13 @@ Accepted upserts and deletes return HTTP 202 with `queued: true`, record type, s
 | POST | /api/v1/ingest/lifecycle_asset | LifeCycleTrack | Create or update equipment or facility |
 | DELETE | /api/v1/ingest/lifecycle_asset/{id} | LifeCycleTrack | Soft-delete an asset/facility copy |
 
-Canonical messages use `event_id`, `event_type`, `source`, `destination`, `version`, `correlation_id`, `occurred_at`, `source_id`, `record_type`, and `payload`. The authenticated token determines source identity; the sender-provided destination is not used for routing. Central resolves destinations from enabled subscriptions. Queue reads never acknowledge messages; a destination acknowledges only after its own database transaction commits.
+Canonical messages use `event_id`, `event_type`, `source`, `destination`, `version`, `correlation_id`, `occurred_at`, `source_id`, `record_type`, and `payload`. `version` is the event schema version (`1.0`); `occurred_at` is the record ordering timestamp currently used by replicas. The authenticated token determines source identity; the sender-provided destination is ignored for routing. Central resolves destinations from enabled subscriptions. Queue reads never acknowledge messages; a destination acknowledges only after its own database transaction commits.
+
+Registered contracts are LifecycleTrack lifecycle assets, UtilityTrack utility bills and anomalies, and MaintainTrack work orders and maintenance results. Utility bills and anomaly references route to LifeCycleTrack; LifecycleTrack asset references route to MaintainTrack and UtilityTrack; MaintainTrack work-order/result events route to LifeCycleTrack. UtilityTrack remains authoritative for bills and anomalies; receiving records in LifeCycleTrack are read-only snapshots. Optional UtilityTrack-to-MaintainTrack routing stays disabled.
 
 ## Accepted payload fields
 
-- utility_bill: id, utility, created_at, billing date/period fields, account number, source, location, readings, consumption, rate, subtotal, VAT, other charges, fee items, total, due date, and status.
+- utility_bill: id, utility, created_at, billing date/period fields, source, location, readings, consumption, rate, subtotal, VAT, other charges, fee items, total, due date, and status. Account numbers are excluded.
 - utility_anomaly: id, created_at, utility, current/previous periods, consumption and cost values, percentage changes, cause, status, and result.
 - lifecycle_asset: id, entity_type (equipment or facility), asset tag, name, brand/model/category, location, acquisition information, condition/lifecycle status, quantity, cost/schedule fields, and timestamps. Images and free-form remarks are excluded.
 
@@ -40,7 +45,6 @@ Unknown properties are dropped. User IDs, account holder names, payment referenc
       "utility": "electricity",
       "billing_date": "2026-10-01",
       "billing_period": "September 2026",
-      "account_number": "ELEC-001245",
       "location": "New Barangay Hall",
       "consumption": 850,
       "total_amount": 8500,
@@ -60,4 +64,4 @@ Unknown properties are dropped. User IDs, account holder names, payment referenc
       "lifecycle_status": "Serviceable"
     }
 
-The worker stores accepted payloads in `central_utility_bills`, `central_utility_anomalies`, or `central_lifecycle_assets`. Failed messages retry after the visibility timeout. After eight failed reads they move to `central_sync_dead_letter` for review. This version has no historical backfill, central read/report API, or cross-system matching.
+Legacy `/api/v1/ingest/...` routes remain compatibility adapters for older clients and continue using the legacy queue. New publishers use `/api/v1/events`. The `20261113_complete_integration.sql` migration adds canonical route registrations, operator status/replay, and a reconciliation run ledger; historical backfill and automated drift detection still require a source worker/checkpoint rollout.

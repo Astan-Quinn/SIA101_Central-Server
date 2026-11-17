@@ -1,6 +1,6 @@
 # Barangay Integrated Management System: Centralized Synchronization Architecture
 
-**Status:** Phase 1 architecture baseline  
+**Status:** Shared contract with first complete event-routing slice
 **Scope:** UtilityTrack, LifecycleTrack, MaintainTrack, and the Central Integration Server  
 **Authority:** This document translates the project request and supplied schema context into the implementation contract. Existing subsystem documents marked draft/preparation are reference material; they do not supersede this contract.
 
@@ -88,23 +88,22 @@ If a destination is offline or returns a retryable error, only its delivery is r
 ```json
 {
   "event_id": "uuid",
-  "source_system": "LifecycleTrack",
-  "event_type": "lifecycle.equipment.upserted",
-  "record_type": "equipment",
-  "source_id": "42",
-  "source_version": 7,
-  "occurred_at": "2026-11-09T08:30:00Z",
-  "operation": "upsert",
-  "schema_version": 1,
+  "event_type": "lifecycle.asset.upserted",
+  "source": "LifeCycleTrack",
+  "destination": null,
+  "version": "1.0",
   "correlation_id": "uuid-or-null",
+  "occurred_at": "2026-11-09T08:30:00Z",
+  "source_id": "42",
+  "record_type": "lifecycle_asset",
   "payload": {"id": "42", "facility_id": "5", "name": "Generator", "status": "Serviceable"}
 }
 ```
 
 - `event_id` is generated once in the source outbox and remains unchanged across retries and destinations.
-- `source_version` is a positive, monotonically increasing integer per source record. Receivers compare it with the version already processed for that source key. Timestamps are audit data, not the ordering authority.
+- `version` is the event schema version (`1.0`). In the current deployed interface, receivers order source changes by `occurred_at` / `source_updated_at`; payload timestamps are UTC-normalized and must come from the source row when available. A future schema may add a monotonic per-record version if all source databases can generate it consistently.
 - The source key is `(source_system, record_type, source_id)`. The outbox also enforces unique `event_id`; Central Server ingestion is idempotent for repeated `event_id` values.
-- Event type names use stable, lower-case dotted names. Initial types are `lifecycle.facility.upserted`, `lifecycle.facility.deleted`, `lifecycle.equipment.upserted`, `lifecycle.equipment.deleted`, `maintenance.work_order.upserted`, `maintenance.inspection.recorded`, `maintenance.repair.recorded`, `maintenance.result.recorded`, `utility.bill.upserted`, `utility.bill.deleted`, `utility.payment.updated`, and `utility.consumption.recorded`.
+- Event type names use stable, lower-case dotted names. Enabled event types are `lifecycle.asset.upserted`, `lifecycle.asset.deleted`, `maintenance.work_order.upserted`, `maintenance.work_order.deleted`, `maintenance.result.recorded`, `utility.bill.upserted`, `utility.bill.deleted`, `utility.anomaly.upserted`, and `utility.anomaly.deleted`. Utility bill and anomaly events route to LifeCycleTrack as read-only snapshots; UtilityTrack remains authoritative.
 - Unknown event types, invalid source/type combinations, malformed IDs, unsupported schema versions, and payloads outside the event allowlist are rejected before fan-out.
 - Payloads contain only operational fields required by destinations. Do not transmit passwords, Supabase keys, session/user identifiers, personal account-holder data, images, storage paths, or free-form notes unless a later field-level contract explicitly approves them.
 
@@ -122,7 +121,7 @@ The detailed executable field maps and constraints belong in the Phase 2 schemas
 
 ## 5. Central processing model
 
-1. A source trigger/RPC inserts an immutable event into that subsystem's `sync_outbox` as part of the business transaction.
+1. A source trigger/RPC inserts an immutable event into that subsystem's outbox as part of the business transaction where available. LifecycleTrack uses this pattern in its PDO transactions; MaintainTrack uses database triggers; UtilityTrack currently uses a user-scoped Supabase REST outbox after its business write, so its source transaction is not yet atomic.
 2. A PHP publisher claims eligible outbox rows and posts the envelope to the Central Server. A source row is marked delivered only after the Central Server returns a durable `202` acknowledgment; transient errors retain the event for retry.
 3. A Central Server RPC validates the source identity, inserts or recognizes the event in `sync_events`, resolves active matching `sync_routes`, inserts one `sync_deliveries` row per target, and sends one pgmq transport message per delivery atomically.
 4. A PHP central worker handles each destination delivery independently. It authenticates to that destination's API and updates only that delivery's attempts, status, response, and next retry time.
@@ -139,7 +138,7 @@ The required Central Server tables are `sync_events`, `sync_deliveries`, `sync_r
 - **Out-of-order event:** destination records/acknowledges the event as stale but does not replace a replica with an older source version.
 - **Dead letter:** retain event, destination, attempt count, timestamps, and sanitized error. Replay keeps the event ID and can be audited.
 - **Initial bootstrap:** use source-side backfill publishers to emit current snapshots through the same event contracts. A checkpoint makes the process resumable; live writes continue into the transactional outbox.
-- **Periodic reconciliation:** source workers compare authoritative IDs/versions with accepted event/replica checkpoints and re-enqueue missing or stale snapshots. Reconciliation does not mutate the authoritative data from another subsystem.
+- **Periodic reconciliation:** weekly source snapshots re-enqueue allowlisted current state with fresh event IDs. Receivers compare source versions and apply only missing or newer replicas; stale deliveries are acknowledged without changing newer local state. Reconciliation does not mutate authoritative records.
 - **Retention:** event and log retention windows, dead-letter retention, and pruning are deployment configuration decisions to be finalized with the Phase 2 schema before production rollout.
 
 ## 7. API contract outline

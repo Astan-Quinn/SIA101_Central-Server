@@ -78,3 +78,29 @@ foreach ([
     }
 }
 echo "All Central Server canonical event validation checks passed.\n";
+
+$utilityBill = [
+    'event_id' => '7f6a6380-ae65-4ba1-a083-5f8947b360b0',
+    'event_type' => 'utility.bill.upserted', 'source' => 'UtilityTrack', 'destination' => 'MaintainTrack',
+    'version' => '1.0', 'correlation_id' => null, 'occurred_at' => '2026-11-13T10:00:00Z',
+    'source_id' => 'bill-40', 'record_type' => 'utility_bill',
+    'payload' => ['id' => 'bill-40', 'utility' => 'electricity', 'account_holder_name' => 'private'],
+];
+$utilityClean = central_validate_integration_event($utilityBill, 'UtilityTrack');
+check(!isset($utilityClean['payload']['account_holder_name']), 'UtilityTrack private payload fields are removed');
+$maintenance = [
+    'event_id' => '2aa108cb-ad69-45ea-a227-5ba7834d2929',
+    'event_type' => 'maintenance.work_order.upserted', 'source' => 'MaintainTrack', 'destination' => null,
+    'version' => '1.0', 'correlation_id' => null, 'occurred_at' => '2026-11-13T10:00:00Z',
+    'source_id' => 'request-7', 'record_type' => 'maintenance_request',
+    'payload' => ['id' => 'request-7', 'status' => 'Completed', 'description' => 'private free-form text'],
+];
+$maintenanceClean = central_validate_integration_event($maintenance, 'MaintainTrack');
+check(!isset($maintenanceClean['payload']['description']), 'maintenance free-form descriptions are removed');
+try {
+    central_validate_integration_event($utilityBill, 'MaintainTrack');
+    check(false, 'cross-source token use is rejected');
+} catch (InvalidArgumentException) {
+    check(true, 'cross-source token use is rejected');
+}
+echo "All three-subsystem canonical contract checks passed.\n";

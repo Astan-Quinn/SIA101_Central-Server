@@ -3,6 +3,8 @@ param(
     [string] $TaskName = 'SIA101-Central-Supabase-Queue-Worker'
 )
 
+$ErrorActionPreference = 'Stop'
+
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $workerPath = Join-Path $projectRoot 'src\worker.php'
 if (-not (Test-Path -LiteralPath $workerPath)) { throw "Worker script not found: $workerPath" }

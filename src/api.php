@@ -32,7 +32,12 @@ function central_supabase_config(): array
     $url = rtrim(trim(central_env('SUPABASE_URL')), '/');
     $key = trim(central_env('SUPABASE_SECRET_KEY'));
     if ($url === '' || $key === '') throw new RuntimeException('Central Supabase is not configured');
-    if (!filter_var($url, FILTER_VALIDATE_URL) || !str_starts_with($url, 'https://')) {
+    $parts = parse_url($url);
+    $localHttp = strtolower(central_env('LOCAL_STAGING_ALLOW_HTTP', 'false')) === 'true'
+        && is_array($parts)
+        && strtolower((string) ($parts['scheme'] ?? '')) === 'http'
+        && in_array(strtolower((string) ($parts['host'] ?? '')), ['127.0.0.1', 'localhost', '::1'], true);
+    if (!filter_var($url, FILTER_VALIDATE_URL) || (!str_starts_with($url, 'https://') && !$localHttp)) {
         throw new RuntimeException('SUPABASE_URL must be an HTTPS URL');
     }
     if (!function_exists('curl_init')) throw new RuntimeException('PHP cURL extension is required');
@@ -92,7 +97,20 @@ function central_route_source(string $recordType): ?string
     return match ($recordType) {
         'utility_bill', 'utility_anomaly' => 'UtilityTrack',
         'lifecycle_asset' => 'LifeCycleTrack',
+        'maintenance_request', 'maintenance_update' => 'MaintainTrack',
         default => null,
+    };
+}
+
+function central_source_event_types(string $source, string $recordType): array
+{
+    return match ([$source, $recordType]) {
+        ['LifeCycleTrack', 'lifecycle_asset'] => ['lifecycle.asset.upserted', 'lifecycle.asset.deleted'],
+        ['UtilityTrack', 'utility_bill'] => ['utility.bill.upserted', 'utility.bill.deleted'],
+        ['UtilityTrack', 'utility_anomaly'] => ['utility.anomaly.upserted', 'utility.anomaly.deleted'],
+        ['MaintainTrack', 'maintenance_request'] => ['maintenance.work_order.upserted', 'maintenance.work_order.deleted', 'maintenance.result.recorded'],
+        ['MaintainTrack', 'maintenance_update'] => ['maintenance.result.recorded'],
+        default => [],
     };
 }
 
@@ -141,7 +159,7 @@ function central_allowed_fields(string $recordType): array
     return match ($recordType) {
         'utility_bill' => [
             'id', 'utility', 'created_at', 'updated_at', 'source_updated_at', 'billing_date', 'billing_period', 'billing_period_from',
-            'billing_period_to', 'account_number', 'source', 'location', 'previous_reading',
+            'billing_period_to', 'source', 'location', 'previous_reading',
             'current_reading', 'consumption', 'rate', 'subtotal', 'vat_amount', 'other_charges',
             'other_fees', 'charge_items', 'total_amount', 'due_date', 'status',
         ],
@@ -150,9 +168,19 @@ function central_allowed_fields(string $recordType): array
             'cur_cost', 'prev_cost', 'pct_cons', 'pct_cost', 'pct_rate', 'cause', 'status', 'result',
         ],
         'lifecycle_asset' => [
-            'id', 'entity_type', 'asset_tag', 'name', 'brand', 'model', 'category', 'location',
+            'id', 'entity_type', 'asset_tag', 'name', 'brand', 'model', 'category', 'location', 'facility_id',
             'date_acquired', 'acquisition_year', 'is_estimated_year', 'condition', 'lifecycle_status',
             'quantity', 'basis', 'cost', 'schedule', 'hours_per_day', 'created_at', 'updated_at', 'source_updated_at',
+        ],
+        'maintenance_request' => [
+            'id', 'display_id', 'facility_id', 'external_facility_id', 'external_facility_name', 'external_equipment_id', 'external_equipment_name', 'specific_area',
+            'equipment_id', 'category', 'equipment_category', 'status',
+            'approval_status', 'priority', 'date_reported', 'date_assigned', 'date_started', 'date_completed',
+            'updated_at', 'source_updated_at', 'maintenance_type', 'completion_outcome',
+        ],
+        'maintenance_update' => [
+            'id', 'request_id', 'status', 'title', 'created_at', 'updated_at', 'source_updated_at',
+            'completion_outcome', 'labor_total', 'parts_total',
         ],
         default => [],
     };
@@ -174,22 +202,22 @@ function central_validate_integration_event(array $event, string $authenticatedS
     if (!preg_match($uuidPattern, $eventId)
         || ($correlation !== null && !preg_match($uuidPattern, (string) $correlation))
         || $source !== $authenticatedSource
-        || $source !== 'LifeCycleTrack'
-        || $recordType !== 'lifecycle_asset'
-        || !in_array($eventType, ['lifecycle.asset.upserted', 'lifecycle.asset.deleted'], true)
+        || !in_array($source, ['LifeCycleTrack', 'UtilityTrack', 'MaintainTrack'], true)
+        || central_route_source($recordType) !== $source
+        || !in_array($eventType, central_source_event_types($source, $recordType), true)
         || $version !== '1.0'
         || $sourceId === '' || strlen($sourceId) > 100
         || strtotime($occurredAt) === false
         || !is_array($payload) || array_is_list($payload)
         || (string) ($payload['id'] ?? '') !== $sourceId
-        || !in_array($payload['entity_type'] ?? null, ['equipment', 'facility'], true)) {
+        || ($recordType === 'lifecycle_asset' && !in_array($payload['entity_type'] ?? null, ['equipment', 'facility'], true))) {
         throw new InvalidArgumentException('Invalid event envelope');
     }
 
     $allowed = central_allowed_fields($recordType);
     $safePayload = array_intersect_key($payload, array_flip($allowed));
     $safePayload['id'] = $sourceId;
-    $safePayload['entity_type'] = $payload['entity_type'];
+    if ($recordType === 'lifecycle_asset') $safePayload['entity_type'] = $payload['entity_type'];
     $clean = [
         'event_id' => strtolower($eventId),
         'event_type' => $eventType,
@@ -222,6 +250,24 @@ function central_authorize_inbox(string $destination): void
     }
 }
 
+function central_authorize_operator(): void
+{
+    $expected = trim(central_env('CENTRAL_OPERATOR_TOKEN'));
+    if ($expected === '') central_json(503, ['ok' => false, 'error' => 'operator_auth_not_configured']);
+    $authorization = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
+    $provided = '';
+    if (preg_match('/^Bearer\s+(.+)$/i', trim((string) $authorization), $matches)) {
+        $provided = trim($matches[1]);
+    } else {
+        // Some Apache/PHP setups omit Authorization from PHP's request vars.
+        // The same-origin operator page sends this dedicated header as a fallback.
+        $provided = trim((string) ($_SERVER['HTTP_X_CENTRAL_OPERATOR_TOKEN'] ?? ''));
+    }
+    if ($provided === '' || !hash_equals($expected, $provided)) {
+        central_json(401, ['ok' => false, 'error' => 'unauthorized']);
+    }
+}
+
 function central_read_request_object(int $maxBytes): array
 {
     $length = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
@@ -238,7 +284,7 @@ function central_handle_integration_request(string $method, string $path): bool
     if ($method === 'POST' && $path === '/api/v1/events') {
         $input = central_read_request_object(max(1024, (int) central_env('MAX_REQUEST_BYTES', '1048576')));
         $source = (string) ($input['source'] ?? '');
-        if (!in_array($source, ['LifeCycleTrack'], true)) central_json(422, ['ok' => false, 'error' => 'unsupported_event_source']);
+        if (!in_array($source, ['LifeCycleTrack', 'UtilityTrack', 'MaintainTrack'], true)) central_json(422, ['ok' => false, 'error' => 'unsupported_event_source']);
         central_authorize($source);
         try {
             $event = central_validate_integration_event($input, $source);
@@ -253,6 +299,82 @@ function central_handle_integration_request(string $method, string $path): bool
         } catch (Throwable $error) {
             error_log('Central integration event intake failed: ' . $error->getMessage());
             central_json(503, ['ok' => false, 'error' => 'event_storage_unavailable']);
+        }
+    }
+
+    if ($method === 'GET' && preg_match('#^/api/v1/sync/status/([0-9a-f-]{36})$#i', $path, $matches)) {
+        $eventId = strtolower($matches[1]);
+        $source = '';
+        $authorization = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
+        if (preg_match('/^Bearer\s+(.+)$/i', trim((string) $authorization), $tokenMatch)) {
+            foreach (['LifeCycleTrack', 'UtilityTrack', 'MaintainTrack'] as $candidate) {
+                $expected = central_token_for($candidate);
+                if ($expected !== '' && hash_equals($expected, trim($tokenMatch[1]))) { $source = $candidate; break; }
+            }
+        }
+        if ($source === '') central_json(401, ['ok' => false, 'error' => 'unauthorized']);
+        try {
+            [, $eventBody] = central_supabase_request('GET', [
+                'event_id' => 'eq.' . $eventId, 'source_system' => 'eq.' . $source,
+                'select' => 'event_id,event_type,source_system,source_id,record_type,occurred_at,received_at', 'limit' => '1',
+            ], null, 'integration_events');
+            $events = json_decode($eventBody, true);
+            if (!is_array($events) || $events === []) central_json(404, ['ok' => false, 'error' => 'event_not_found']);
+            [, $deliveryBody] = central_supabase_request('GET', [
+                'event_id' => 'eq.' . $eventId,
+                'select' => 'destination_system,status,attempts,next_attempt_at,processed_at,dead_lettered_at,last_error,created_at,updated_at',
+                'order' => 'destination_system.asc',
+            ], null, 'integration_delivery_logs');
+            central_json(200, ['ok' => true, 'event' => $events[0], 'deliveries' => json_decode($deliveryBody, true) ?: []]);
+        } catch (Throwable $error) {
+            error_log('Central sync status lookup failed: ' . $error->getMessage());
+            central_json(503, ['ok' => false, 'error' => 'status_unavailable']);
+        }
+    }
+
+    if ($method === 'GET' && $path === '/api/v1/admin/summary') {
+        central_authorize_operator();
+        try {
+            [, $deliveryBody] = central_supabase_request('GET', [
+                'select' => 'event_id,source_system,event_type,destination_system,status,attempts,next_attempt_at,dead_lettered_at,last_error,updated_at',
+                'order' => 'updated_at.desc', 'limit' => (string) max(1, min(500, (int) ($_GET['limit'] ?? 100))),
+            ], null, 'integration_delivery_logs');
+            [, $deadBody] = central_supabase_request('GET', [
+                'select' => 'failed_event_id,event_id,destination_system,attempts,failure_reason,failed_at,replayed_at',
+                'replayed_at' => 'is.null', 'order' => 'failed_at.desc', 'limit' => '100',
+            ], null, 'failed_events');
+            [, $healthBody] = central_supabase_request('GET', [
+                'select' => 'subsystem_code,health_status,last_seen_at,updated_at', 'order' => 'subsystem_code.asc',
+            ], null, 'subsystem_registry');
+            [, $reconciliationBody] = central_supabase_request('GET', [
+                'select' => 'run_id,source_system,record_type,status,checkpoint,scanned_count,enqueued_count,error_summary,started_at,finished_at',
+                'order' => 'started_at.desc', 'limit' => '50',
+            ], null, 'sync_reconciliation_runs');
+            central_json(200, [
+                'ok' => true,
+                'deliveries' => json_decode($deliveryBody, true) ?: [],
+                'open_dead_letters' => json_decode($deadBody, true) ?: [],
+                'subsystem_health' => json_decode($healthBody, true) ?: [],
+                'reconciliation_runs' => json_decode($reconciliationBody, true) ?: [],
+            ]);
+        } catch (Throwable $error) {
+            error_log('Central operator summary failed: ' . $error->getMessage());
+            central_json(503, ['ok' => false, 'error' => 'operator_status_unavailable']);
+        }
+    }
+
+    if ($method === 'POST' && preg_match('#^/api/v1/admin/dead-letters/(\d+)/replay$#', $path, $matches)) {
+        central_authorize_operator();
+        try {
+            [, $body] = central_supabase_request('POST', [], [
+                'p_failed_event_id' => (int) $matches[1],
+                'p_actor' => 'central_operator',
+            ], 'rpc/integration_replay_dead_letter');
+            $replayed = json_decode($body, true) === true;
+            central_json($replayed ? 202 : 404, ['ok' => $replayed, 'replayed' => $replayed]);
+        } catch (Throwable $error) {
+            error_log('Central dead-letter replay failed: ' . $error->getMessage());
+            central_json(503, ['ok' => false, 'error' => 'replay_unavailable']);
         }
     }
 
@@ -354,10 +476,19 @@ function handle_api_request(): never
     $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     $path = parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH) ?: '/';
     $path = '/' . trim(preg_replace('#/+#', '/', $path), '/');
+    $scriptDirectory = str_replace('\\', '/', dirname((string) ($_SERVER['SCRIPT_NAME'] ?? '')));
+    $scriptDirectory = rtrim($scriptDirectory, '/.');
+    if ($scriptDirectory !== '' && $scriptDirectory !== '/' && str_starts_with($path, $scriptDirectory . '/')) {
+        $path = substr($path, strlen($scriptDirectory));
+    }
 
     if ($method === 'GET' && preg_match('#/api/v1/health$#', $path)) {
         try {
             central_supabase_config();
+            central_supabase_request('GET', ['select'=>'subsystem_code','limit'=>'1'], null, 'subsystem_registry');
+            central_supabase_request('PATCH', ['subsystem_code'=>'eq.CentralServer'], [
+                'health_status'=>'healthy', 'last_seen_at'=>gmdate('c'), 'updated_at'=>gmdate('c'),
+            ], 'subsystem_registry');
             central_json(200, ['ok' => true, 'service' => 'SIA101 Central Server', 'api_version' => 'v1', 'queue' => 'central_sync_events']);
         } catch (Throwable $error) {
             error_log('Central API configuration error: ' . $error->getMessage());
